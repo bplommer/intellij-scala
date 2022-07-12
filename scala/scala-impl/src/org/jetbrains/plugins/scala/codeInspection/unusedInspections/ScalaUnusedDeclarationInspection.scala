@@ -4,11 +4,7 @@ import com.intellij.codeInspection.ProblemHighlightType
 import com.intellij.codeInspection.deadCode.UnusedDeclarationInspectionBase
 import com.intellij.openapi.roots.TestSourcesFilter
 import com.intellij.psi._
-import com.intellij.psi.impl.source.tree.LeafPsiElement
-import com.intellij.psi.search._
-import com.intellij.psi.search.searches.ReferencesSearch
 import org.jetbrains.annotations.Nls
-import org.jetbrains.plugins.scala.annotator.usageTracker.ScalaRefCountHolder
 import org.jetbrains.plugins.scala.codeInspection.ScalaInspectionBundle
 import org.jetbrains.plugins.scala.codeInspection.ui.InspectionOptionsComboboxPanel
 import org.jetbrains.plugins.scala.extensions._
@@ -16,21 +12,18 @@ import org.jetbrains.plugins.scala.lang.lexer.ScalaModifier
 import org.jetbrains.plugins.scala.lang.psi.ScalaPsiUtil
 import org.jetbrains.plugins.scala.lang.psi.ScalaPsiUtil.{inNameContext, isOnlyVisibleInLocalFile, superValsSignatures}
 import org.jetbrains.plugins.scala.lang.psi.api.ScalaPsiElement
-import org.jetbrains.plugins.scala.lang.psi.api.base.ScStableCodeReference
-import org.jetbrains.plugins.scala.lang.psi.api.base.patterns.ScReferencePattern
 import org.jetbrains.plugins.scala.lang.psi.api.base.types.ScSelfTypeElement
 import org.jetbrains.plugins.scala.lang.psi.api.statements.params.{ScClassParameter, ScParameter, ScTypeParam}
-import org.jetbrains.plugins.scala.lang.psi.api.statements.{ScEnumCase, ScFunction, ScFunctionDeclaration, ScFunctionDefinition}
+import org.jetbrains.plugins.scala.lang.psi.api.statements.{ScFunction, ScFunctionDeclaration, ScFunctionDefinition}
 import org.jetbrains.plugins.scala.lang.psi.api.toplevel.typedef._
 import org.jetbrains.plugins.scala.lang.psi.api.toplevel.{ScModifierListOwner, ScNamedElement}
 import org.jetbrains.plugins.scala.lang.psi.impl.search.ScalaOverridingMemberSearcher
 import org.jetbrains.plugins.scala.project.{ModuleExt, ScalaLanguageLevel}
 import org.jetbrains.plugins.scala.util.SAMUtil.PsiClassToSAMExt
-import org.jetbrains.plugins.scala.util.{ScalaMainMethodUtil, ScalaUsageNamesUtil}
+import org.jetbrains.plugins.scala.util.ScalaMainMethodUtil
 
 import javax.swing.JComponent
 import scala.beans.{BeanProperty, BooleanBeanProperty}
-import scala.jdk.CollectionConverters._
 
 final class ScalaUnusedDeclarationInspection extends HighlightingPassInspection {
 
@@ -61,161 +54,6 @@ final class ScalaUnusedDeclarationInspection extends HighlightingPassInspection 
     panel
   }
 
-  private def isElementUsed(element: ScNamedElement, isOnTheFly: Boolean): Boolean = {
-    if (!isReportingEnabledForElement(element)) {
-      true
-    } else if (isOnlyVisibleInLocalFile(element)) {
-      if (isOnTheFly) {
-        localSearch(element)
-      } else {
-        referencesSearch(element)
-      }
-    } else if (referencesSearch(element)) {
-      true
-    } else if (!reportPublicDeclarations) {
-      true
-    } else if (checkIfEnumUsedOutsideScala(element)) {
-      true
-    } else if (ScalaPsiUtil.isImplicit(element)) {
-      true
-    } else {
-      textSearch(element)
-    }
-  }
-
-  private def isReportingEnabledForElement(element: ScNamedElement): Boolean =
-    if (reportLocalDeclarations == AlwaysEnabled) {
-      true
-    } else {
-      element.nameContext match {
-        case m: ScMember if m.isLocal && reportLocalDeclarations == AlwaysDisabled =>
-          false
-        case m: ScMember if m.isLocal && reportLocalDeclarations == ComplyToCompilerOption =>
-          val compilerOptions = element.module.map(_.scalaCompilerSettings.additionalCompilerOptions).getOrElse(Nil)
-          compilerOptions.contains("-Wunused:locals") || compilerOptions.contains("-Wunused:linted") || compilerOptions.contains("-Xlint:unused")
-        case _ =>
-          true
-      }
-    }
-
-  // this case is for elements accessible only in a local scope
-  private def localSearch(element: ScNamedElement): Boolean = {
-    //we can trust RefCounter because references are counted during highlighting
-    val refCounter = ScalaRefCountHolder(element)
-
-    var used = false
-    val success = refCounter.runIfUnusedReferencesInfoIsAlreadyRetrievedOrSkip { () =>
-      used = refCounter.isValueReadUsed(element) || refCounter.isValueWriteUsed(element)
-    }
-
-    !success || used // Return true also if runIfUnused... was a failure
-  }
-
-  // this case is for elements accessible not only in a local scope, but within the same file
-  private def referencesSearch(element: ScNamedElement): Boolean = {
-    val elementsForSearch = element match {
-      // if the element is an enum case, we also look for usage in a few synthetic methods generated for the enum class
-      case enumCase: ScEnumCase =>
-        val syntheticMembers =
-          ScalaPsiUtil.getCompanionModule(enumCase.enumParent)
-            .toSeq.flatMap(_.membersWithSynthetic)
-            .collect {
-              case n: ScNamedElement if ScalaUsageNamesUtil.enumSyntheticMethodNames.contains(n.name) => n
-            }
-        enumCase.getSyntheticCounterpart +: syntheticMembers
-      case e: ScNamedElement => Seq(e)
-    }
-
-    val scope = new LocalSearchScope(element.getContainingFile)
-    elementsForSearch.exists(ReferencesSearch.search(_, scope).findFirst() != null)
-  }
-
-  // if the element is an enum case, and the enum class is accessed from outside Scala, we assume the enum case is used
-  private def checkIfEnumUsedOutsideScala(element: ScNamedElement): Boolean = {
-    val scEnum = element match {
-      case el: ScEnumCase => Some(el.enumParent)
-      case el: ScEnum => Some(el)
-      case _ => None
-    }
-
-    scEnum.exists { e =>
-      var used = false
-
-      val processor = new TextOccurenceProcessor {
-        override def execute(e2: PsiElement, offsetInElement: Int): Boolean =
-          inReadAction {
-            if (e2.getContainingFile.isScala3File || e2.getContainingFile.isScala2File) {
-              true
-            } else {
-              used = true
-              false
-            }
-          }
-      }
-
-      PsiSearchHelper
-        .getInstance(element.getProject)
-        .processElementsWithWord(
-          processor,
-          element.getUseScope,
-          e.getName, // for usage of enum methods through `EnumName.methodName(...)`
-          (UsageSearchContext.IN_CODE | UsageSearchContext.IN_FOREIGN_LANGUAGES).toShort,
-          true
-        )
-
-      if (!used) {
-        PsiSearchHelper
-          .getInstance(element.getProject)
-          .processElementsWithWord(
-            processor,
-            element.getUseScope,
-            s"${e.getName}$$.MODULE$$", // for usage of enum methods through `EnumName$.MODULE$.methodName(...)`
-            (UsageSearchContext.IN_CODE | UsageSearchContext.IN_FOREIGN_LANGUAGES).toShort,
-            true
-          )
-      }
-      used
-    }
-  }
-
-  // if the element is accessible from other files, we check that with a text search
-  private def textSearch(element: ScNamedElement): Boolean = {
-    val helper = PsiSearchHelper.getInstance(element.getProject)
-    var used = false
-    val processor = new TextOccurenceProcessor {
-      override def execute(e2: PsiElement, offsetInElement: Int): Boolean = {
-        inReadAction {
-          if (element.getContainingFile == e2.getContainingFile) {
-            true
-          } else {
-            used = (e2, Option(e2.getParent)) match {
-              case (_, Some(_: ScReferencePattern)) => false
-              case (_, Some(_: ScTypeDefinition)) => false
-              case (_: PsiIdentifier, _) => true
-              case (l: LeafPsiElement, _) if l.isIdentifier => true
-              case (_: ScStableCodeReference, _) => true
-              case _ => false
-            }
-            !used
-          }
-        }
-      }
-    }
-
-    ScalaUsageNamesUtil.getStringsToSearch(element).asScala.foreach { name =>
-      if (!used) {
-        helper.processElementsWithWord(
-          processor,
-          element.getUseScope,
-          name,
-          (UsageSearchContext.IN_CODE | UsageSearchContext.IN_FOREIGN_LANGUAGES).toShort,
-          true
-        )
-      }
-    }
-    used
-  }
-
   override def invoke(element: PsiElement, isOnTheFly: Boolean): Seq[ProblemInfo] = {
 
     if (!shouldProcessElement(element)) {
@@ -238,12 +76,14 @@ final class ScalaUnusedDeclarationInspection extends HighlightingPassInspection 
         case named: ScNamedElement => Seq(InspectedElement(named, named))
         case _ => Seq.empty
       }
+
       elements.flatMap {
         case InspectedElement(_, _: ScTypeParam) if !isOnTheFly => Seq.empty
         case InspectedElement(_, typeParam: ScTypeParam) if typeParam.hasBounds || typeParam.hasImplicitBounds => Seq.empty
         case InspectedElement(_, inNameContext(holder: PsiAnnotationOwner)) if hasUnusedAnnotation(holder) =>
           Seq.empty
-        case InspectedElement(original: ScNamedElement, delegate: ScNamedElement) if !isElementUsed(delegate, isOnTheFly) =>
+        case InspectedElement(original: ScNamedElement, delegate: ScNamedElement)
+          if CheapRefSearcher.search(delegate, isOnTheFly, reportPublicDeclarations).isEmpty =>
 
           val dontReportPublicDeclarationsQuickFix =
             if (isOnlyVisibleInLocalFile(original)) None else Some(new DontReportPublicDeclarationsQuickFix(original))
@@ -273,30 +113,19 @@ final class ScalaUnusedDeclarationInspection extends HighlightingPassInspection 
     }
   }
 
-  override def shouldProcessElement(elem: PsiElement): Boolean = elem match {
-    case e if !isOnlyVisibleInLocalFile(e) && TestSourcesFilter.isTestSources(e.getContainingFile.getVirtualFile, e.getProject) => false
-    case _: ScSelfTypeElement => false
-    case e: ScalaPsiElement if e.module.exists(_.isBuildModule) => false
-    case e: PsiElement if UnusedDeclarationInspectionBase.isDeclaredAsEntryPoint(e) && !ScalaPsiUtil.isImplicit(e) => false
-    case obj: ScObject if ScalaMainMethodUtil.hasScala2MainMethod(obj) => false
-    case n: ScNamedElement if n.nameId == null || n.name == "_" || isOverridingOrOverridden(n) => false
-    case n: ScNamedElement =>
-      n match {
-        case p: ScModifierListOwner if hasOverrideModifier(p) => false
-        case fd: ScFunctionDefinition if ScalaMainMethodUtil.isMainMethod(fd) => false
-        case f: ScFunction if f.isSpecial || isOverridingFunction(f) || f.isConstructor => false
-        case p: ScClassParameter if p.isCaseClassVal || p.isEnumVal || p.isEnumCaseVal => false
-        case p: ScParameter =>
-          p.parent.flatMap(_.parent.flatMap(_.parent)) match {
-            case Some(_: ScFunctionDeclaration) => false
-            case Some(f: ScFunctionDefinition) if ScalaOverridingMemberSearcher.search(f).nonEmpty ||
-              isOverridingFunction(f) || ScalaMainMethodUtil.isMainMethod(f) => false
-            case _ => true
-          }
-        case _ => true
-      }
-    case _ => false
-  }
+  override def shouldProcessElement(elem: PsiElement): Boolean =
+    elem match {
+      case n: ScNamedElement =>
+        n.nameContext match {
+          case m: ScMember if m.isLocal && reportLocalDeclarations == AlwaysDisabled =>
+            false
+          case m: ScMember if m.isLocal && reportLocalDeclarations == ComplyToCompilerOption =>
+            val compilerOptions = n.module.toSeq.flatMap(_.scalaCompilerSettings.additionalCompilerOptions)
+            compilerOptions.contains("-Wunused:locals") || compilerOptions.contains("-Wunused:linted") || compilerOptions.contains("-Xlint:unused")
+          case _ => true
+        }
+      case _ => true
+    }
 }
 
 object ScalaUnusedDeclarationInspection {
