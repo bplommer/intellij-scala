@@ -89,13 +89,7 @@ object CheapRefSearcher {
     } else if (ScalaPsiUtil.isImplicit(element)) {
       Seq(UnknownElementUsage)
     } else {
-      element match {
-        case f: ScFunctionDefinition if !f.name.endsWith("_=") => ReferencesSearch.search(f).asScala.toSeq.map { ref =>
-          KnownElementUsage(ref.getElement, element)
-        }
-        case _ =>
-          textSearch(element)
-      }
+      textSearch(element)
     }
   }
 
