@@ -1,26 +1,17 @@
 package org.jetbrains.plugins.scala.codeInspection.declarationRedundancy
 
 import com.intellij.codeInspection.ProblemHighlightType
-import com.intellij.codeInspection.deadCode.UnusedDeclarationInspectionBase
-import com.intellij.openapi.roots.TestSourcesFilter
 import com.intellij.psi._
 import org.jetbrains.annotations.Nls
 import org.jetbrains.plugins.scala.codeInspection.ScalaInspectionBundle
 import org.jetbrains.plugins.scala.codeInspection.ui.InspectionOptionsComboboxPanel
-import org.jetbrains.plugins.scala.extensions._
-import org.jetbrains.plugins.scala.lang.lexer.ScalaModifier
-import org.jetbrains.plugins.scala.lang.psi.ScalaPsiUtil
-import org.jetbrains.plugins.scala.lang.psi.ScalaPsiUtil.{inNameContext, isOnlyVisibleInLocalFile, superValsSignatures}
-import org.jetbrains.plugins.scala.lang.psi.api.ScalaPsiElement
-import org.jetbrains.plugins.scala.lang.psi.api.base.types.ScSelfTypeElement
-import org.jetbrains.plugins.scala.lang.psi.api.statements.params.{ScClassParameter, ScParameter, ScTypeParam}
-import org.jetbrains.plugins.scala.lang.psi.api.statements.{ScFunction, ScFunctionDeclaration, ScFunctionDefinition}
+import org.jetbrains.plugins.scala.lang.psi.ScalaPsiUtil.{inNameContext, isOnlyVisibleInLocalFile}
+import org.jetbrains.plugins.scala.lang.psi.api.statements.ScFunctionDeclaration
+import org.jetbrains.plugins.scala.lang.psi.api.statements.params.ScTypeParam
+import org.jetbrains.plugins.scala.lang.psi.api.toplevel.ScNamedElement
 import org.jetbrains.plugins.scala.lang.psi.api.toplevel.typedef._
-import org.jetbrains.plugins.scala.lang.psi.api.toplevel.{ScModifierListOwner, ScNamedElement}
-import org.jetbrains.plugins.scala.lang.psi.impl.search.ScalaOverridingMemberSearcher
 import org.jetbrains.plugins.scala.project.{ModuleExt, ScalaLanguageLevel}
 import org.jetbrains.plugins.scala.util.SAMUtil.PsiClassToSAMExt
-import org.jetbrains.plugins.scala.util.ScalaMainMethodUtil
 
 import javax.swing.JComponent
 import scala.beans.{BeanProperty, BooleanBeanProperty}
@@ -55,61 +46,55 @@ final class ScalaUnusedDeclarationInspection extends HighlightingPassInspection 
   }
 
   override def invoke(element: PsiElement, isOnTheFly: Boolean): Seq[ProblemInfo] = {
+    // Structure to encapsulate the possibility to check a delegate element to determine
+    // usedness of the original PsiElement passed into `invoke`.
+    // When a ProblemInfo is created, we still want it to pertain to the original element under inspection,
+    // that was passed into `invoke`, and not to the delegate.
+    // So we use the delegate only to determine usedness, and the original for all other operations.
+    case class InspectedElement(original: ScNamedElement, delegate: ScNamedElement)
 
-    if (!shouldProcessElement(element)) {
-      Seq.empty
-    } else {
+    val elements: Seq[InspectedElement] = element match {
+      case functionDeclaration: ScFunctionDeclaration
+        if Option(functionDeclaration.containingClass).exists(_.isSAMable) =>
+        Option(functionDeclaration.containingClass).toSeq
+          .collect { case named: ScNamedElement => named }
+          .map(InspectedElement(functionDeclaration, _))
+      case named: ScNamedElement => Seq(InspectedElement(named, named))
+      case _ => Seq.empty
+    }
 
-      // Structure to encapsulate the possibility to check a delegate element to determine
-      // usedness of the original PsiElement passed into `invoke`.
-      // When a ProblemInfo is created, we still want it to pertain to the original element under inspection,
-      // that was passed into `invoke`, and not to the delegate.
-      // So we use the delegate only to determine usedness, and the original for all other operations.
-      case class InspectedElement(original: ScNamedElement, delegate: ScNamedElement)
+    elements.flatMap {
+      case InspectedElement(_, _: ScTypeParam) if !isOnTheFly => Seq.empty
+      case InspectedElement(_, typeParam: ScTypeParam) if typeParam.hasBounds || typeParam.hasImplicitBounds => Seq.empty
+      case InspectedElement(_, inNameContext(holder: PsiAnnotationOwner)) if hasUnusedAnnotation(holder) =>
+        Seq.empty
+      case InspectedElement(original: ScNamedElement, delegate: ScNamedElement)
+        if delegate.getUsages(isOnTheFly, reportPublicDeclarations).isEmpty =>
 
-      val elements: Seq[InspectedElement] = element match {
-        case functionDeclaration: ScFunctionDeclaration
-          if Option(functionDeclaration.getContainingClass).exists(_.isSAMable) =>
-          Option(functionDeclaration.getContainingClass).toSeq
-            .collect { case named: ScNamedElement => named }
-            .map(InspectedElement(functionDeclaration, _))
-        case named: ScNamedElement => Seq(InspectedElement(named, named))
-        case _ => Seq.empty
-      }
+        val dontReportPublicDeclarationsQuickFix =
+          if (isOnlyVisibleInLocalFile(original)) None else Some(new DontReportPublicDeclarationsQuickFix(original))
 
-      elements.flatMap {
-        case InspectedElement(_, _: ScTypeParam) if !isOnTheFly => Seq.empty
-        case InspectedElement(_, typeParam: ScTypeParam) if typeParam.hasBounds || typeParam.hasImplicitBounds => Seq.empty
-        case InspectedElement(_, inNameContext(holder: PsiAnnotationOwner)) if hasUnusedAnnotation(holder) =>
-          Seq.empty
-        case InspectedElement(original: ScNamedElement, delegate: ScNamedElement)
-          if CheapRefSearcher.search(delegate, isOnTheFly, reportPublicDeclarations).isEmpty =>
+        val addScalaAnnotationUnusedQuickFix = if (delegate.scalaLanguageLevelOrDefault < ScalaLanguageLevel.Scala_2_13)
+          None else Some(new AddScalaAnnotationUnusedQuickFix(original))
 
-          val dontReportPublicDeclarationsQuickFix =
-            if (isOnlyVisibleInLocalFile(original)) None else Some(new DontReportPublicDeclarationsQuickFix(original))
+        val message = if (isOnTheFly) {
+          ScalaUnusedDeclarationInspection.annotationDescription
+        } else {
+          UnusedDeclarationVerboseProblemInfoMessage(original)
+        }
 
-          val addScalaAnnotationUnusedQuickFix = if (delegate.scalaLanguageLevelOrDefault < ScalaLanguageLevel.Scala_2_13)
-            None else Some(new AddScalaAnnotationUnusedQuickFix(original))
-
-          val message = if (isOnTheFly) {
-            ScalaUnusedDeclarationInspection.annotationDescription
-          } else {
-            UnusedDeclarationVerboseProblemInfoMessage(original)
-          }
-
-          Seq(
-            ProblemInfo(
-              original.nameId,
-              message,
-              ProblemHighlightType.LIKE_UNUSED_SYMBOL,
-              DeleteUnusedElementFix.quickfixesFor(original) ++
-                dontReportPublicDeclarationsQuickFix ++
-                addScalaAnnotationUnusedQuickFix
-            )
+        Seq(
+          ProblemInfo(
+            original.nameId,
+            message,
+            ProblemHighlightType.LIKE_UNUSED_SYMBOL,
+            DeleteUnusedElementFix.quickfixesFor(original) ++
+              dontReportPublicDeclarationsQuickFix ++
+              addScalaAnnotationUnusedQuickFix
           )
-        case _ =>
-          Seq.empty
-      }
+        )
+      case _ =>
+        Seq.empty
     }
   }
 
@@ -131,18 +116,6 @@ final class ScalaUnusedDeclarationInspection extends HighlightingPassInspection 
 object ScalaUnusedDeclarationInspection {
   @Nls
   val annotationDescription: String = ScalaInspectionBundle.message("declaration.is.never.used")
-
-  private def hasOverrideModifier(member: ScModifierListOwner): Boolean =
-    member.hasModifierPropertyScala(ScalaModifier.OVERRIDE)
-
-  private def isOverridingOrOverridden(element: PsiNamedElement): Boolean =
-    superValsSignatures(element, withSelfType = true).nonEmpty || isOverridden(element)
-
-  private def isOverridingFunction(func: ScFunction): Boolean =
-    hasOverrideModifier(func) || func.superSignatures.nonEmpty || isOverridden(func)
-
-  private def isOverridden(member: PsiNamedElement): Boolean =
-    ScalaOverridingMemberSearcher.search(member, deep = false, withSelfType = true).nonEmpty
 
   private def hasUnusedAnnotation(holder: PsiAnnotationOwner): Boolean =
     holder.hasAnnotation("scala.annotation.unused") ||

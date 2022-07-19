@@ -41,41 +41,26 @@ class TypeAnnotationInspection extends AbstractInspection {
 
 object TypeAnnotationInspection {
 
+  def getReasonForTypeAnnotationOn(element: ScalaPsiElement, implementation: Option[ScExpression]): Option[String] = {
+    val declaration = Declaration(element)
+    val location = Location(element)
+
+    ScalaTypeAnnotationSettings(element.getProject).reasonForTypeAnnotationOn(
+      declaration, location, implementation.map(Expression))
+  }
+
   private def inspect(element: ScalaPsiElement,
                       anchor: PsiElement,
                       implementation: Option[ScExpression])
                      (implicit holder: ProblemsHolder): Unit = {
 
-    val declaration = Declaration(element)
-    val location = Location(element)
-
-    ScalaTypeAnnotationSettings(element.getProject).reasonForTypeAnnotationOn(
-      declaration, location, implementation.map(Expression)).foreach { reason =>
-
-      // TODO Create the general-purpose inspection
-      val canBePrivate = !declaration.entity.isParameter &&
-        !location.isInLocalScope && declaration.visibility == Visibility.Default
+    getReasonForTypeAnnotationOn(element, implementation).foreach { reason =>
 
       val fixes =
-        canBePrivate.seq(new MakePrivateQuickFix(element.asInstanceOf[ScModifierListOwner])) ++
-          Seq(new AddTypeAnnotationQuickFix(anchor), new ModifyCodeStyleQuickFix(), new LearnWhyQuickFix())
+          Seq(new AddTypeAnnotationQuickFix(anchor), new ModifyCodeStyleQuickFix())
 
       holder.registerProblem(anchor, ScalaInspectionBundle.message("type.annotation.required.for", reason), fixes: _*)
     }
-  }
-
-  private class MakePrivateQuickFix(element: ScModifierListOwner) extends AbstractFixOnPsiElement(ScalaInspectionBundle.message("quickfix.make.private"), element) {
-
-    override protected def doApplyFix(element: ScModifierListOwner)
-                                     (implicit project: Project): Unit = {
-      element.setModifierProperty("private")
-    }
-  }
-
-  @nowarn("cat=deprecation")
-  private class LearnWhyQuickFix extends LocalQuickFixBase(ScalaInspectionBundle.message("learn.why")) {
-    override def applyFix(project: Project, problemDescriptor: ProblemDescriptor): Unit =
-      DesktopUtils.browse("https://blog.jetbrains.com/scala/2016/10/05/beyond-code-style/")
   }
 
   @nowarn("cat=deprecation")
